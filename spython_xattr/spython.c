@@ -7,11 +7,17 @@
 #include "Python.h"
 #include "pystrhex.h"
 
+/* xattr, stat */
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
 
+/* seccomp */
+#include <sys/prctl.h>
+#include <seccomp.h>
+
+/* hashing */
 #include <openssl/evp.h>
 
 // 2 MB
@@ -19,6 +25,54 @@
 
 #define XATTR_NAME "user.org.python.x-spython-hash"
 #define XATTR_LENGTH ((EVP_MAX_MD_SIZE * 2) + 1)
+
+static int
+spython_seccomp_setxattr(int kill) {
+    scmp_filter_ctx *ctx = NULL;
+    uint32_t action;
+    int rc = ENOMEM;
+    unsigned int i;
+    int syscalls[] = {
+        SCMP_SYS(setxattr),
+        SCMP_SYS(fsetxattr),
+        SCMP_SYS(lsetxattr)
+    };
+
+    if (kill) {
+       action = SCMP_ACT_KILL_PROCESS;
+    } else {
+        action = SCMP_ACT_ERRNO(EPERM);
+    }
+    /* execve(2) does not grant additional privileges */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1) {
+        perror("PR_SET_NO_NEW_PRIVS=1\n");
+        return -1;
+    }
+    /* allow all syscalls by default */
+    ctx = seccomp_init(SCMP_ACT_ALLOW);
+    if (ctx == NULL) {
+        goto end;
+    }
+    /* block setxattr syscalls */
+    for (i=0; i < (sizeof(syscalls)/sizeof(syscalls[0])); i++) {
+        rc = seccomp_rule_add(ctx, action, syscalls[i], 0);
+        if (rc < 0) {
+            goto end;
+        }
+    }
+    /* load seccomp rules into Kernel */
+    rc = seccomp_load(ctx);
+    if (rc < 0) {
+        goto end;
+    }
+
+  end:
+    seccomp_release(ctx);
+    if (rc != 0) {
+        perror("seccomp failed.\n");
+    }
+    return rc;
+}
 
 
 /* hash a Python bytes object */
@@ -181,7 +235,7 @@ spython_open_code(PyObject *path, void *userData)
 
   end:
     Py_XDECREF(filename_obj);
-    if (fd < 0) {
+    if (fd >= 0) {
         close(fd);
     }
     return stream;
@@ -192,6 +246,10 @@ main(int argc, char **argv)
 {
     PyStatus status;
     PyConfig config;
+
+    if (spython_seccomp_setxattr(0) < 0) {
+        exit(1);
+    }
 
     status = PyConfig_InitIsolatedConfig(&config);
     if (PyStatus_Exception(status)) {
