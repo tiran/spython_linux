@@ -1,0 +1,3 @@
+*.o
+spython
+__pycache__
